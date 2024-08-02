@@ -1,2 +1,3 @@
 reward/wandb/**
 test.ipynb
+reward/__pycache__/**

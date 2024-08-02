@@ -23,22 +23,29 @@ from datasets import load_dataset
 
 
 class IMDBPairsDataset(Dataset):
-    def __init__(self, tokenizer, split="train", num_proc=4, max_length=512):
+    def __init__(
+        self,
+        tokenizer,
+        split="train",
+        num_proc=4,
+        max_length=512,
+        shuffle=False,
+        seed=42,
+    ):
 
         def tokenization(example):
             return tokenizer(example["text"], max_length=max_length)
 
-        self.dataset = load_dataset("imdb", split=split).map(
-            tokenization, batched=True, num_proc=num_proc
-        )
-        self.tokenizer = tokenizer
-
-        self.positive_reviews = self.dataset.filter(
+        dataset = load_dataset("imdb", split=split).map(tokenization, batched=True, num_proc=num_proc)
+        self.positive_reviews = dataset.filter(
             lambda x: x["label"] == 1, num_proc=num_proc
         )
-        self.negative_reviews = self.dataset.filter(
+        self.negative_reviews = dataset.filter(
             lambda x: x["label"] == 0, num_proc=num_proc
         )
+        if shuffle:
+            self.positive_reviews = self.positive_reviews.shuffle(seed=seed)
+            self.negative_reviews = self.negative_reviews.shuffle(seed=seed)
 
     def __len__(self):
         return len(self.positive_reviews) * len(self.negative_reviews)
@@ -94,25 +101,25 @@ if __name__ == "__main__":
     # Dataset
     ################
     train_dataset = IMDBPairsDataset(
-        tokenizer, split="train", max_length=config.max_length
+        tokenizer, split="train", max_length=config.max_length, shuffle=True
     )
-    # eval_dataset = IMDBPairsDataset(tokenizer, split='test', max_length=config.max_length)
+    eval_dataset = IMDBPairsDataset(
+        tokenizer, split="test[:80]+test[-80:]", max_length=config.max_length
+    )
 
     ################
     # Training
     ################
-    peft_config = get_peft_config(model_config)
     trainer = RewardTrainer(
         model=model,
         tokenizer=tokenizer,
         args=config,
         train_dataset=train_dataset,
-        # eval_dataset=eval_dataset,
-        peft_config=peft_config,
+        eval_dataset=eval_dataset,
+        peft_config=get_peft_config(model_config),
     )
     trainer.train()
     trainer.save_model(config.output_dir)
-    trainer.push_to_hub()
-    # metrics = trainer.evaluate()
-    # trainer.log_metrics("eval", metrics)
-    # print(metrics)
+    metrics = trainer.evaluate()
+    trainer.log_metrics("eval", metrics)
+    print(metrics)

@@ -11,7 +11,9 @@ python warp/train.py \
     --gradient_checkpointing=True \
     --is_peft_model=True \
     --learning_rate 1.41e-5 \
-    --batch_size 1 \
+    --batch_size 16 \
     --mini_batch_size 1 \
+    --output_dir=data/warp_gpt2_imdb \
+    --steps=100
     # --log_with wandb \
 

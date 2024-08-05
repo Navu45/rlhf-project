@@ -1,8 +1,8 @@
 # wandb login
 # python reward_modeling.py --help
-python reward_modeling.py \
+python reward/train.py \
     --model_name_or_path=distilbert/distilbert-base-cased \
-    --output_dir="reward_modeling_imdb" \
+    --output_dir="reward_modeling_imdb_peft" \
     --per_device_train_batch_size=16 \
     --max_steps=10000 \
     --gradient_accumulation_steps=2 \
@@ -21,11 +21,10 @@ python reward_modeling.py \
     --save_steps=1000 \
     --save_total_limit=5 \
     --load_best_model_at_end=True \
-    --fp16=True
-
-    # --use_peft=True \
-    # --lora_target_modules "q_lin" "k_lin" "v_lin" "out_lin" "lin1" "lin2" \
-    # --lora_task_type="SEQ_CLS" \
-    # --auto_find_batch_size=True \
-    # --fp16=True \
-    # --lora_modules_to_save "classifier.bias" "classifier.weight" "pre_classifier.bias" "pre_classifier.weight" \
+    --fp16=True \
+    --max_steps=3 \
+    --use_peft=True \
+    --lora_target_modules "q_lin" "k_lin" "v_lin" "out_lin" \
+    --lora_task_type="SEQ_CLS" \
+    --auto_find_batch_size=True \
+    --lora_modules_to_save "classifier.bias" "classifier.weight" "pre_classifier.bias" "pre_classifier.weight" \

@@ -1,3 +1,5 @@
-reward/wandb/**
+*/wandb/**
 test.ipynb
-reward/__pycache__/**
+data/**
+*/__pycache__/**
+wandb/**

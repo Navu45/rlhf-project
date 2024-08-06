@@ -48,10 +48,6 @@ args, ppo_config = parser.parse_args_into_dataclasses()
 
 shutil.rmtree(args.output_dir, ignore_errors=True)
 
-# We then define the arguments to pass to the sentiment analysis pipeline.
-# We set `return_all_scores` to True to get the sentiment score for each token.
-sent_kwargs = {"return_all_scores": False, "function_to_apply": "none", "batch_size": ppo_config.batch_size}
-
 trl_model_class = (
     AutoModelForCausalLMWithValueHead
     if not args.use_seq2seq
@@ -63,7 +59,7 @@ trl_model_class = (
 # from the `datasets` library. One should customize this function to train the model on
 # its own dataset.
 def build_dataset(
-    config, query_dataset, input_min_text_length=8, input_max_text_length=20
+    config, query_dataset, input_min_text_length=8, input_max_text_length=15
 ):
     """
     Build dataset for training. This builds the dataset from `load_dataset`, one should
@@ -89,7 +85,7 @@ def build_dataset(
         sample["query"] = tokenizer.decode(sample["input_ids"])
         return sample
 
-    ds = ds.map(tokenize, batched=False, num_proc=4)
+    ds = ds.map(tokenize, batched=False)
     ds.set_format(type="torch")
     return ds
 
@@ -179,6 +175,10 @@ generation_kwargs = {
     "pad_token_id": tokenizer.eos_token_id,
     "max_new_tokens": 80,
 }
+# We then define the arguments to pass to the sentiment analysis pipeline.
+# We set `return_all_scores` to True to get the sentiment score for each token.
+sent_kwargs = {'top_k': None, "function_to_apply": "none", "batch_size": ppo_config.batch_size}
+
 
 for i in range(2):
     for current_model in peft_model.train_adapters:
@@ -200,7 +200,6 @@ for i in range(2):
             # Compute sentiment score
             texts = [q + r for q, r in zip(batch["query"], batch["response"])]
             pipe_outputs = sentiment_pipe(texts, **sent_kwargs)
-            print(pipe_outputs[0])
             rewards = [torch.tensor(output[1]["score"]) for output in pipe_outputs]
             ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
             ref_pipe_outputs = sentiment_pipe(ref_texts, **sent_kwargs)

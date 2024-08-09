@@ -28,6 +28,10 @@ def slerp(
     ), "This implementation of SLERP takes only 2 adapters to merge!"
 
     delta_1, delta_2 = [task_tensor - base_tensor for task_tensor in task_tensors]
+    
+    assert not torch.isnan(delta_1).any(), 'No Nan!!!'
+    assert not torch.isnan(delta_2).any(), 'No Nan!!!'
+
     weight_1, weight_2 = weights
 
     cos_omega = torch.dot(delta_1.flatten(), delta_2.flatten()) / (
@@ -37,11 +41,17 @@ def slerp(
     delta_1 *= torch.sin((1 - weight_1) * omega) / torch.sin(omega)
     delta_2 *= torch.sin(weight_2 * omega) / torch.sin(omega)
     mixed_task_tensors = base_tensor + delta_1 + delta_2
+    
+    assert not torch.isnan(mixed_task_tensors).any(), 'No Nan!!!'
     return mixed_task_tensors
 
 
-def ema(task_tensor: torch.Tensor, anchor_tensor: torch.Tensor, weight: float):
-    return (1 - weight) * anchor_tensor + weight * task_tensor[0]
+def ema(task_tensors: torch.Tensor, anchor_tensor: torch.Tensor, weight: float):
+    task_tensors = torch.stack(task_tensors, dim=0)
+    mixed_task_tensor = (1 - weight) * anchor_tensor + weight * task_tensors
+
+    assert not torch.isnan(mixed_task_tensor).any(), 'No Nan!!!'
+    return mixed_task_tensor
 
 
 class WarpModel(PeftModelForCausalLM):
@@ -68,7 +78,7 @@ class WarpModel(PeftModelForCausalLM):
     def weight_averaging_step(self, wa_type, adapters, adapter_name, weight):
 
         if wa_type not in ["slerp", "ema"]:
-            raise NotImplementedError("Only SLERP and EMA for weight averaging")
+            raise NotImplementedError("Only (\'slerp\', \'ema\') for weight averaging")
 
         if adapter_name not in list(self.peft_config.keys()):
             _, new_rank, new_target_modules = self._check_add_weighted_adapter(

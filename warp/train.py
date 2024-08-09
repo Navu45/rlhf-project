@@ -17,8 +17,9 @@ from trl import (
 from trl.core import LengthSampler
 from trl.import_utils import is_npu_available, is_xpu_available
 from warp_model import WarpModel
-from warp_trainer import REINFORCETrainer
+from warp_trainer import WarpTrainer
 
+import os
 import shutil
 
 
@@ -39,14 +40,23 @@ class ScriptArguments:
     lora_alpha: Optional[float] = field(
         default=16, metadata={"help": "the lora alpha parameter"}
     )
+    ema_coef: Optional[int] = field(
+        default=16, metadata={"help": "the rate coefficient for EMA"}
+    )
+    slerp_coef: Optional[int] = field(
+        default=16, metadata={"help": "the rate coefficient for SLERP"}
+    )
+    iterations: Optional[int] = field(
+        default=2, metadata={"help": "the num of iterations for WARP training"}
+    )
     lora_r: Optional[int] = field(default=16, metadata={"help": "the lora r parameter"})
-    output_dir: Optional[str] = field(default='data/warp', metadata={"help": "directory to save model"})
+    output_dir: Optional[str] = field(
+        default="data/warp", metadata={"help": "directory to save model"}
+    )
 
 
 parser = HfArgumentParser((ScriptArguments, PPOConfig))
-args, ppo_config = parser.parse_args_into_dataclasses()
-
-shutil.rmtree(args.output_dir, ignore_errors=True)
+args, config = parser.parse_args_into_dataclasses()
 
 trl_model_class = (
     AutoModelForCausalLMWithValueHead
@@ -91,7 +101,7 @@ def build_dataset(
 
 
 # We retrieve the dataloader by calling the `build_dataset` function.
-dataset = build_dataset(ppo_config, ppo_config.query_dataset)
+dataset = build_dataset(config, config.query_dataset)
 
 
 def collator(data):
@@ -99,12 +109,12 @@ def collator(data):
 
 
 # set seed before initializing value head for deterministic eval
-set_seed(ppo_config.seed)
+set_seed(config.seed)
 
 # Now let's build the model, the reference model, and the tokenizer.
 if not args.use_peft:
     ref_model = trl_model_class.from_pretrained(
-        ppo_config.model_name, trust_remote_code=args.trust_remote_code
+        config.model_name, trust_remote_code=args.trust_remote_code
     )
     device_map = None
     peft_config = None
@@ -120,37 +130,49 @@ else:
     device_map = {"": Accelerator().local_process_index}
 
 model = trl_model_class.from_pretrained(
-    ppo_config.model_name,
+    config.model_name,
     trust_remote_code=args.trust_remote_code,
     device_map=device_map,
     peft_config=peft_config,
 )
 
-tokenizer = AutoTokenizer.from_pretrained(ppo_config.model_name)
+tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
 # Some tokenizers like GPT-2's don't have a padding token by default, so we set one here.
 tokenizer.pad_token_id = tokenizer.eos_token_id
 
-peft_model = WarpModel(model, peft_config, 'merge', anchor_adapter='ema', train_adapters=['rl1', 'rl2'])
 
-# We then build the PPOTrainer, passing the model, the reference model, the tokenizer
-ppo_trainer = REINFORCETrainer(
-    ppo_config, model, peft_model=peft_model, tokenizer=tokenizer, dataset=dataset, data_collator=collator
-)
+def prepare_trainer(model):
+    peft_model = WarpModel(
+        model, peft_config, "merge", anchor_adapter="ema", train_adapters=["rl1", "rl2"]
+    )
+    # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
+    trainer = WarpTrainer(
+        config,
+        model,
+        peft_model=peft_model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        data_collator=collator,
+    )
+    return peft_model, trainer
+
+
+peft_model, trainer = prepare_trainer(model)
 
 # We then build the sentiment analysis pipeline, passing the model name and the
 # sentiment analysis pipeline arguments. Let's also make sure to set the device
 # to the same device as the PPOTrainer.
-device = ppo_trainer.accelerator.device
-if ppo_trainer.accelerator.num_processes == 1:
+device = trainer.accelerator.device
+if trainer.accelerator.num_processes == 1:
     if is_xpu_available():
         device = "xpu:0"
     elif is_npu_available():
         device = "npu:0"
     else:
         device = 0 if torch.cuda.is_available() else "cpu"  # to avoid a `pipeline` bug
-ds_plugin = ppo_trainer.accelerator.state.deepspeed_plugin
-task, model_name = ppo_config.reward_model.split(":")
+ds_plugin = trainer.accelerator.state.deepspeed_plugin
+task, model_name = config.reward_model.split(":")
 if ds_plugin is not None and ds_plugin.is_zero3_init_enabled():
     with ds_plugin.zero3_init_context_manager(enable=False):
         sentiment_pipe = pipeline(task, model=model_name, device=device)
@@ -177,22 +199,28 @@ generation_kwargs = {
 }
 # We then define the arguments to pass to the sentiment analysis pipeline.
 # We set `return_all_scores` to True to get the sentiment score for each token.
-sent_kwargs = {'top_k': None, "function_to_apply": "none", "batch_size": ppo_config.batch_size}
+sent_kwargs = {
+    "top_k": None,
+    "function_to_apply": "none",
+    "batch_size": config.batch_size,
+}
 
 
-for i in range(2):
+for i in range(args.iterations):
     for current_model in peft_model.train_adapters:
         peft_model.current_adapter = current_model
-        for _epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
+        for step, batch in tqdm(enumerate(trainer.dataloader), total=config.steps):
+            if step == config.steps:
+                break
+
             query_tensors = batch["input_ids"]
 
             # Get response from gpt2
-            peft_model.current_adapter = current_model
-            response_tensors, ref_response_tensors = ppo_trainer.generate(
+            response_tensors, ref_response_tensors = trainer.generate(
                 query_tensors,
                 return_prompt=False,
                 generate_ref_response=True,
-                **generation_kwargs
+                **generation_kwargs,
             )
             batch["response"] = tokenizer.batch_decode(response_tensors)
             batch["ref_response"] = tokenizer.batch_decode(ref_response_tensors)
@@ -203,21 +231,35 @@ for i in range(2):
             rewards = [torch.tensor(output[1]["score"]) for output in pipe_outputs]
             ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
             ref_pipe_outputs = sentiment_pipe(ref_texts, **sent_kwargs)
-            ref_rewards = [torch.tensor(output[1]["score"]) for output in ref_pipe_outputs]
+            ref_rewards = [
+                torch.tensor(output[1]["score"]) for output in ref_pipe_outputs
+            ]
             batch["ref_rewards"] = ref_rewards
 
             # Run PPO step
-            stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
-            ppo_trainer.log_stats(
+            stats = trainer.step(query_tensors, response_tensors, rewards)
+            trainer.log_stats(
                 stats,
                 batch,
                 rewards,
                 columns_to_log=["query", "response", "ref_response", "ref_rewards"],
             )
-            peft_model.weight_averaging_step('ema', ['rl2'], 'ema', 0.2)
+            peft_model.weight_averaging_step(
+                "ema", [current_model], peft_model.anchor_adapter, args.ema_coef
+            )
 
-    peft_model.weight_averaging_step('slerp', ['rl1', 'rl2'], 'merge', 0.2)
     peft_model.set_adapter(peft_model.base_adapter)
-    peft_model.merge_adapter()
-    ppo_trainer._save_pretrained(args.output_dir)
-    
+    peft_model.weight_averaging_step(
+        "slerp", peft_model.train_adapters, peft_model.base_adapter, args.slerp_coef
+    )
+    merged_model = peft_model.merge_and_unload(
+        progressbar=True, safe_merge=True, adapter_names=[peft_model.base_adapter]
+    )
+    iter_output_dir = f"{args.output_dir}/iter-{i}/"
+
+    if not os.path.isdir(iter_output_dir):
+        os.makedirs(iter_output_dir)
+
+    merged_model.save_pretrained(iter_output_dir)
+    del model, trainer, peft_model
+    peft_model, trainer = prepare_trainer(merged_model)

@@ -106,7 +106,7 @@ outputs = model(**inputs, labels=inputs["input_ids"])
 """
 
 
-class REINFORCETrainer(BaseTrainer):
+class WarpTrainer(BaseTrainer):
     _tag_names = ["trl", "ppo"]
 
     def __init__(
@@ -120,7 +120,6 @@ class REINFORCETrainer(BaseTrainer):
         data_collator: Optional[typing.Callable] = None,
         lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
         training_data_collator: Optional[typing.Callable] = None,
-        adapters: Optional[List[str]] = ["merge", "ema"],
     ):
         """
         Initialize REINFORCETrainer.
@@ -268,6 +267,16 @@ class REINFORCETrainer(BaseTrainer):
                 raise ValueError(
                     "lr_scheduler must be a torch.optim.lr_scheduler._LRScheduler or torch.optim.lr_scheduler.LRScheduler (for torch >= 2.0)"
                 )
+            
+        if self.config.adap_kl_ctrl:
+            self.kl_ctl = AdaptiveKLController(self.config.init_kl_coef, self.config.target, self.config.horizon)
+        else:
+            self.kl_ctl = FixedKLController(self.config.init_kl_coef)
+        
+        # Safety checkers for DS integration
+        is_deepspeed_used = self.accelerator.distributed_type == "DEEPSPEED" and hasattr(
+            self.accelerator.state, "deepspeed_plugin"
+        )
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -282,9 +291,6 @@ class REINFORCETrainer(BaseTrainer):
                 self.model.pretrained_model.get_input_embeddings().register_forward_hook(
                     make_inputs_require_grad
                 )
-
-        self.base_adapter, self.anchor_adapter = adapters
-        self.current_adapter = None
 
         (
             self.model,
@@ -448,7 +454,7 @@ class REINFORCETrainer(BaseTrainer):
                 **generation_kwargs,
             )
             if generate_ref_response:
-                self.peft_model.set_adapter(self.peft_model.base_adapter)
+                self.peft_model.set_adapter(self.peft_model.anchor_adapter)
                 ref_response = self._generate_batched(
                     self.model,
                     query_tensor,
@@ -475,7 +481,7 @@ class REINFORCETrainer(BaseTrainer):
                 )
 
             if generate_ref_response:
-                self.peft_model.set_adapter(self.peft_model.base_adapter)
+                self.peft_model.set_adapter(self.peft_model.anchor_adapter)
                 with unwrap_model_for_generation(
                     self.peft_model, self.accelerator, is_peft_model=self.is_peft_model
                 ) as unwrapped_model:
@@ -532,8 +538,7 @@ class REINFORCETrainer(BaseTrainer):
             ).to(self.current_device)
 
             with unwrap_model_for_generation(
-                model,
-                self.accelerator,
+                model, self.accelerator,
             ) as unwrapped_model:
                 generations = unwrapped_model.generate(
                     **padded_inputs, **generation_kwargs
@@ -563,7 +568,7 @@ class REINFORCETrainer(BaseTrainer):
         batch_size: int,
         queries: List[torch.LongTensor],
         responses: List[torch.LongTensor],
-        rewards: List[torch.FloatTensor],
+        scores: List[torch.FloatTensor],
         masks: Optional[List[torch.LongTensor]] = None,
     ):
         """
@@ -576,15 +581,15 @@ class REINFORCETrainer(BaseTrainer):
                 List of tensors containing the encoded queries of shape (`query_length`)
             responses (List[`torch.LongTensor`]):
                 List of tensors containing the encoded responses of shape (`response_length`)
-            rewards (List[`torch.FloatTensor`]):
-                List of tensors containing the rewards.
+            scores (List[`torch.FloatTensor`]):
+                List of tensors containing the scores.
             masks (List[`torch.LongTensor`], *optional*):
                 list of optional tensors containing the masks of shape (`response_length`)
         Returns:
             `tuple`: The input processed data.
         """
         for name, tensor_list in zip(
-            ["queries", "responses", "rewards"], [queries, responses, rewards]
+            ["queries", "responses", "scores"], [queries, responses, scores]
         ):
             if not isinstance(tensor_list, list):
                 raise ValueError(
@@ -599,45 +604,45 @@ class REINFORCETrainer(BaseTrainer):
                     f"Batch size ({batch_size}) does not match number of examples - but got {len(tensor_list)} for: {name}"
                 )
 
-        # add queries, rewards and responses on the correct device
+        # add queries, scores and responses on the correct device
         queries = [tensor.to(self.current_device) for tensor in queries]
         responses = [tensor.to(self.current_device) for tensor in responses]
-        rewards = [tensor.to(self.current_device) for tensor in rewards]
+        scores = [tensor.to(self.current_device) for tensor in scores]
         masks = (
             [tensor.to(self.current_device) for tensor in masks]
             if masks is not None
             else None
         )
 
-        # squeeze rewards if needed
-        for i, reward in enumerate(rewards):
+        # squeeze scores if needed
+        for i, reward in enumerate(scores):
             if reward.dim() > 1:
                 raise ValueError(
-                    f"rewards must be 1-dimensional - got {reward.dim()} for {reward}"
+                    f"scores must be 1-dimensional - got {reward.dim()} for {reward}"
                 )
             elif reward.dim() == 1:
-                rewards[i] = reward.squeeze()
+                scores[i] = reward.squeeze()
 
-        return queries, responses, rewards, masks
+        return queries, responses, scores, masks
 
     @PPODecorators.empty_device_cache()
     def step(
         self,
         queries: List[torch.LongTensor],
         responses: List[torch.LongTensor],
-        rewards: List[torch.FloatTensor],
+        scores: List[torch.FloatTensor],
         response_masks: Optional[List[torch.LongTensor]] = None,
     ):
         """
-        Run a PPO optimisation step given a list of queries, model responses, and rewards.
+        Run a PPO optimisation step given a list of queries, model responses, and scores.
 
         Args:
             queries (List[`torch.LongTensor`]):
                 List of tensors containing the encoded queries of shape (`query_length`)
             responses (List[`torch.LongTensor`]):
                 List of tensors containing the encoded responses of shape (`response_length`)
-            rewards (List[`torch.FloatTensor`]):
-                List of tensors containing the rewards.
+            scores (List[`torch.FloatTensor`]):
+                List of tensors containing the scores.
             response_masks (List[`torch.FloatTensor`], *optional*)):
                 List of tensors containing masks of the response tokens.
 
@@ -646,15 +651,36 @@ class REINFORCETrainer(BaseTrainer):
         """
         bs = self.config.batch_size
 
-        queries, responses, rewards, response_masks = self._step_safety_checker(
-            bs, queries, responses, rewards, response_masks
+        queries, responses, scores, response_masks = self._step_safety_checker(
+            bs, queries, responses, scores, response_masks
         )
-        rewards = torch.tensor(rewards, device=self.current_device)
+        scores = torch.tensor(scores, device=self.current_device)
+
+        if self.config.use_score_scaling:
+            # Score scaling
+            scores_mean, scores_std = self.running.update(scores)
+            tensor_to_kwargs = dict(dtype=scores.dtype, device=scores.device)
+            score_scaling_factor = (
+                self.running.std.to(**tensor_to_kwargs) + torch.finfo(scores.dtype).eps
+            )
+            if self.config.use_score_norm:
+                scores = (
+                    scores - self.running.mean.to(**tensor_to_kwargs)
+                ) / score_scaling_factor
+            else:
+                scores /= score_scaling_factor
+
+        if self.config.score_clip is not None:
+            # Score clipping
+            scores_dtype = scores.dtype
+            scores = torch.clip(
+                scores.float(), -self.config.score_clip, self.config.score_clip
+            ).to(dtype=scores_dtype)
 
         # if we want to push best model to the hub
         if hasattr(self, "highest_reward"):
             if self.compare_step % self.config.compare_steps == 0:
-                curr_mean_reward = rewards.mean()
+                curr_mean_reward = scores.mean()
                 # if the best reward ever seen
                 if curr_mean_reward > self.highest_reward:
                     self.highest_reward = curr_mean_reward
@@ -701,17 +727,47 @@ class REINFORCETrainer(BaseTrainer):
 
         model_inputs_names = list(model_inputs.keys())
 
+        full_kl_penalty = self.config.kl_penalty == "full"
+
         with torch.no_grad():
-            all_logprobs, _, masks = self.batched_forward_pass(
+            self.peft_model.set_adapter(self.peft_model.current_adapter)
+            all_logprobs, logits_or_none, masks = self.batched_forward_pass(
                 self.model,
                 queries,
                 responses,
                 model_inputs,
                 response_masks=response_masks,
-                return_logits=False,
+                return_logits=full_kl_penalty,
             )
+            with self.optional_peft_ctx():
+                self.peft_model.set_adapter(self.peft_model.anchor_adapter)
+                ref_logprobs, ref_logits_or_none, _ = self.batched_forward_pass(
+                    self.peft_model if self.is_peft_model else self.model,
+                    queries,
+                    responses,
+                    model_inputs,
+                    return_logits=full_kl_penalty,
+                )
 
         timing["time/ppo/forward_pass"] = time.time() - t
+
+        with torch.no_grad():
+            t = time.time()
+            if full_kl_penalty:
+                active_full_logprobs = logprobs_from_logits(logits_or_none, None, gather=False)
+                ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
+
+                rewards, non_score_reward, kls = self.compute_rewards(
+                    scores, active_full_logprobs, ref_full_logprobs, masks
+                )
+            else:
+                rewards, non_score_reward, kls = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
+            timing["time/ppo/compute_rewards"] = time.time() - t
+            
+            # We dont need to calculate advantages and returns, we optimize rewards directly
+            # t = time.time()
+            # values, advantages, returns = self.compute_advantages(values, rewards, masks)
+            # timing["time/ppo/compute_advantages"] = time.time() - t
 
         # upcast to float32 to avoid dataset issues
         batch_dict = {
@@ -726,6 +782,8 @@ class REINFORCETrainer(BaseTrainer):
         t = time.time()
         all_stats = []
         early_stop = False
+        
+        self.peft_model.set_adapter(self.peft_model.current_adapter)
         for _ in range(self.config.ppo_epochs):
             if early_stop:
                 break
@@ -736,6 +794,7 @@ class REINFORCETrainer(BaseTrainer):
                 )
                 backward_batch_inds = b_inds[backward_batch_start:backward_batch_end]
 
+                # Mini-batch is always of size 1, but left logic like that here
                 for mini_batch_start in range(
                     0, self.config.backward_batch_size, self.config.mini_batch_size
                 ):
@@ -768,11 +827,20 @@ class REINFORCETrainer(BaseTrainer):
                             return_logits=True,
                         )
                         train_stats = self.train_minibatch(
+                            mini_batch_dict["logprobs"],
                             logprobs,
-                            mini_batch_dict["rewards"],
+                            logits,
                             mini_batch_dict["masks"],
+                            mini_batch_dict["rewards"],
                         )
                         all_stats.append(train_stats)
+
+            # typically, early stopping is done at the epoch level
+            if self.config.early_stopping:
+                policykl = train_stats["policy/policykl"]
+                early_stop = self._early_stop(policykl)
+                if early_stop:
+                    break
 
         timing["time/ppo/optimize_step"] = time.time() - t
 
@@ -780,13 +848,18 @@ class REINFORCETrainer(BaseTrainer):
         train_stats = stack_dicts(all_stats)
 
         stats = self.record_step_stats(
-            rewards=rewards,
+            scores=scores,
             logprobs=all_logprobs,
+            ref_logprobs=ref_logprobs,
+            non_score_reward=non_score_reward,
             train_stats=train_stats,
+            kl_coef=self.kl_ctl.value,
             masks=masks,
             queries=queries,
             responses=responses,
+            kls=kls,
         )
+
         # Gather/Reduce stats from all processes
         if self.is_distributed:
             stats = self.gather_stats(stats)
@@ -919,8 +992,6 @@ class REINFORCETrainer(BaseTrainer):
             (tuple):
                 - all_logprobs (`torch.FloatTensor`): Log probabilities of the responses,
                     shape (`batch_size`, `response_length`)
-                - all_ref_logprobs (`torch.FloatTensor`): Log probabilities of the responses,
-                    shape (`batch_size`, `response_length`)
         """
         bs = len(queries)
         fbs = self.config.mini_batch_size
@@ -986,9 +1057,11 @@ class REINFORCETrainer(BaseTrainer):
     @PPODecorators.empty_device_cache()
     def train_minibatch(
         self,
+        old_logprobs: torch.FloatTensor,
         logprobs: torch.FloatTensor,
-        rewards: torch.FloatTensor,
+        logits: torch.FloatTensor,
         mask: torch.LongTensor,
+        rewards: torch.FloatTensor,
     ):
         """
         Train one PPO minibatch
@@ -1010,7 +1083,7 @@ class REINFORCETrainer(BaseTrainer):
                 Dictionary of training statistics
         """
         self.model.train()
-        loss, train_stats = self.loss(logprobs, rewards, mask)
+        loss, train_stats = self.loss(old_logprobs, logits, logprobs, mask, rewards)
         self.accelerator.backward(loss)
         if self.config.max_grad_norm is not None:
             if self.accelerator.sync_gradients:
@@ -1023,31 +1096,114 @@ class REINFORCETrainer(BaseTrainer):
         self.optimizer.zero_grad()
         return train_stats
 
-    def loss(
+    def compute_rewards(
         self,
+        scores: torch.FloatTensor,
         logprobs: torch.FloatTensor,
-        rewards: torch.FloatTensor,
-        mask: torch.LongTensor,
+        ref_logprobs: torch.FloatTensor,
+        masks: torch.LongTensor,
     ):
         """
-        Calculate policy and value losses for REINFORCE.
+        Compute per token rewards from scores and KL-penalty.
 
         Args:
-            logprobs (torch.FloatTensor): Log probabilities of the model, shape (batch_size, response_length)
-            rewards (torch.FloatTensor): Rewards from the reward model, shape (batch_size, response_length)
+            scores (`torch.FloatTensor`):
+                Scores from the reward model, shape (`batch_size`)
+            logprobs (`torch.FloatTensor`):
+                Log probabilities of the model, shape (`batch_size`, `response_length`)
+            ref_logprobs (`torch.FloatTensor`):
+                Log probabilities of the reference model, shape (`batch_size`, `response_length`)
+
+        Returns:
+            `torch.FloatTensor`: Per token rewards, shape (`batch_size`, `response_length`)
+            `torch.FloatTensor`: Non score rewards, shape (`batch_size`, `response_length`)
+            `torch.FloatTensor`: KL penalty, shape (`batch_size`, `response_length`)
         """
-        # Compute the policy gradient loss
-        policy_loss = masked_mean(-logprobs * rewards, mask)
+        rewards, non_score_rewards, kls = [], [], []
+        for score, logprob, ref_logprob, mask in zip(
+            scores, logprobs, ref_logprobs, masks
+        ):
+            # compute KL penalty (from difference in logprobs)
+            kl = self._kl_penalty(logprob, ref_logprob)
+            kls.append(kl)
+            non_score_reward = -(self.kl_ctl.value * kl).sum()
+            non_score_rewards.append(non_score_reward)
+            reward = score + non_score_reward
+            rewards.append(reward)
+        return torch.stack(rewards), torch.stack(non_score_rewards), torch.stack(kls)
 
-        # Calculate additional stats for logging
-        entropy = -(logprobs * torch.exp(logprobs)).sum(dim=-1).mean()
+    def _kl_penalty(
+        self, logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        if self.config.kl_penalty == "kl":
+            return logprob - ref_logprob
 
-        stats = {
-            "loss/policy": policy_loss.detach(),
-            "policy/entropy": entropy.detach(),
-        }
+        if self.config.kl_penalty == "abs":
+            return (logprob - ref_logprob).abs()
 
-        return policy_loss, stats
+        if self.config.kl_penalty == "mse":
+            return 0.5 * (logprob - ref_logprob).square()
+
+        if self.config.kl_penalty == "full":
+            # Flip is required due to this issue? :https://github.com/pytorch/pytorch/issues/57459
+            return F.kl_div(
+                ref_logprob, logprob, log_target=True, reduction="none"
+            ).sum(-1)
+
+        raise NotImplementedError
+
+    def loss(
+        self,
+        old_logprobs: torch.FloatTensor,
+        logits: torch.FloatTensor,
+        logprobs: torch.FloatTensor,
+        mask: torch.LongTensor,
+        rewards: torch.FloatTensor,
+    ):
+        """
+        Calculate policy and value losses.
+
+        Args:
+            old_logprobs (`torch.FloatTensor`):
+                Log probabilities of the model, shape (`batch_size`, `response_length`)
+            rewards (`torch.FloatTensor`):
+                Rewards from the reward model, shape (`batch_size`, `response_length`)
+            logits (`torch.FloatTensor`):
+                Logits of the model, shape (`batch_size`, `response_length`, `vocab_size`)
+            logprobs (`torch.FloatTensor`):
+                Log probabilities of the model, shape (`batch_size`, `response_length`)
+        """
+
+        ratio = torch.exp(logprobs - old_logprobs)
+        pg_losses = -rewards * ratio
+        loss = masked_mean(pg_losses, mask)
+
+        avg_ratio = masked_mean(ratio, mask).item()
+        if avg_ratio > self.config.ratio_threshold:
+            warnings.warn(
+                f"The average ratio of batch ({avg_ratio:.2f}) exceeds threshold {self.config.ratio_threshold:.2f}. Skipping batch."
+            )
+            loss = loss * 0.0
+            loss = loss * 0.0
+
+        entropy = masked_mean(entropy_from_logits(logits), mask)
+
+        approxkl = 0.5 * masked_mean((logprobs - old_logprobs) ** 2, mask)
+        policykl = masked_mean(old_logprobs - logprobs, mask)
+
+        stats = dict(
+            loss=dict(
+                policy=loss.detach(), total=loss.detach()
+            ),
+            policy=dict(
+                entropy=entropy.detach(),
+                approxkl=approxkl.detach(),
+                policykl=policykl.detach(),
+                ratio=ratio.detach(),
+            ),
+        )
+        return loss, flatten_dict(stats)
+
 
     def record_step_stats(self, **data):
         """

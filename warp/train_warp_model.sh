@@ -10,10 +10,11 @@ python warp/train.py \
     --ppo_epochs=1 \
     --gradient_checkpointing=False \
     --is_peft_model=True \
-    --learning_rate 1.41e-5 \
-    --batch_size 16 \
+    --learning_rate 1.34e-6 \
+    --batch_size 64 \
     --mini_batch_size 1 \
     --output_dir=data/warp_gpt2_imdb \
-    --steps=5 \
-    --log_with wandb \
+    --steps=100 \
+    --iterations=1 \
+    # --log_with wandb \
 
